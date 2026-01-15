@@ -1,5 +1,5 @@
 app = "fycharts"
-primary_region = "sin"
+primary_region = "sea"
 
 [build]
   builder = "paketobuildpacks/builder:base"
