@@ -87,14 +87,17 @@ def parse_date(value, param_name):
         ) from exc
 
 
-def build_dates(start, end, is_weekly, is_viral):
+def build_dates(start, end, is_weekly, is_viral, latest_only_if_unset=False):
     valid_dates = defaultListOfDates(is_weekly, is_viral)
     valid_date_map = {
         datetime.strptime(date_str, "%Y-%m-%d"): date_str for date_str in valid_dates
     }
     valid_date_list = sorted(valid_date_map.keys())
 
-    if start is None:
+    if start is None and end is None and latest_only_if_unset:
+        start_dt = valid_date_list[-1]
+        end_dt = valid_date_list[-1]
+    elif start is None:
         start_dt = valid_date_list[0]
     else:
         start_dt = parse_date(start, "start")
@@ -115,7 +118,10 @@ def build_dates(start, end, is_weekly, is_viral):
             )
 
     if end is None:
-        end_dt = valid_date_list[-1]
+        if start is None and latest_only_if_unset:
+            end_dt = valid_date_list[-1]
+        else:
+            end_dt = valid_date_list[-1]
     else:
         end_dt = parse_date(end, "end")
         if end_dt > valid_date_list[-1]:
@@ -146,12 +152,31 @@ def normalize_regions(regions):
     return regions
 
 
+def is_empty_df(df):
+    if "track name" not in df.columns:
+        return False
+    return df["track name"].eq("NA").all()
+
+
 def fetch_chart(fetch_fn, dates, regions):
     output = []
+    misses = []
     for date in dates:
         for region in regions:
             df = fetch_fn(date, region)
+            if is_empty_df(df):
+                misses.append(f"{date}/{region}")
+                continue
             output.extend(df.to_dict(orient="records"))
+    if not output:
+        detail = "No chart data returned for requested dates/regions."
+        if misses:
+            detail = (
+                "Spotifycharts returned no CSV data for: "
+                + ", ".join(misses)
+                + "."
+            )
+        raise HTTPException(status_code=502, detail=detail)
     return output
 
 
@@ -166,7 +191,7 @@ def top200_daily(
     end: str | None = None,
     region: list[str] | None = Query(default=None),
 ):
-    dates = build_dates(start, end, is_weekly=False, is_viral=False)
+    dates = build_dates(start, end, is_weekly=False, is_viral=False, latest_only_if_unset=True)
     regions = normalize_regions(region)
     data = fetch_chart(charts.helperTop200Daily, dates, regions)
     return {"chart": "top_200_daily", "data": data}
@@ -178,7 +203,7 @@ def top200_weekly(
     end: str | None = None,
     region: list[str] | None = Query(default=None),
 ):
-    dates = build_dates(start, end, is_weekly=True, is_viral=False)
+    dates = build_dates(start, end, is_weekly=True, is_viral=False, latest_only_if_unset=True)
     regions = normalize_regions(region)
     data = fetch_chart(charts.helperTop200Weekly, dates, regions)
     return {"chart": "top_200_weekly", "data": data}
@@ -190,7 +215,7 @@ def viral50_daily(
     end: str | None = None,
     region: list[str] | None = Query(default=None),
 ):
-    dates = build_dates(start, end, is_weekly=False, is_viral=True)
+    dates = build_dates(start, end, is_weekly=False, is_viral=True, latest_only_if_unset=True)
     regions = normalize_regions(region)
     data = fetch_chart(charts.helperViral50Daily, dates, regions)
     return {"chart": "viral_50_daily", "data": data}
@@ -202,7 +227,7 @@ def viral50_weekly(
     end: str | None = None,
     region: list[str] | None = Query(default=None),
 ):
-    dates = build_dates(start, end, is_weekly=True, is_viral=True)
+    dates = build_dates(start, end, is_weekly=True, is_viral=True, latest_only_if_unset=True)
     regions = normalize_regions(region)
     data = fetch_chart(charts.helperViral50Weekly, dates, regions)
     return {"chart": "viral_50_weekly", "data": data}
