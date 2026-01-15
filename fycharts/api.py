@@ -1,8 +1,9 @@
 from datetime import datetime
+import os
 
+import requests
 from fastapi import FastAPI, HTTPException, Query
 
-from fycharts.crawler_base import SpotifyChartsBase
 from fycharts.compute_dates import defaultListOfDates
 
 
@@ -73,8 +74,20 @@ REGION_CODES = {
     "vn",
 }
 
-app = FastAPI(title="fycharts API", version="0.1.0")
-charts = SpotifyChartsBase()
+app = FastAPI(title="fycharts API", version="0.2.0")
+
+CHARTS_BASE_URL = os.getenv(
+    "SPOTIFY_CHARTS_BASE_URL",
+    "https://charts-spotify-com-service.spotify.com/auth/v0/charts",
+)
+CHARTS_TOKEN = os.getenv("SPOTIFY_CHARTS_TOKEN")
+
+ALIAS_TEMPLATES = {
+    ("top200", "daily"): "regional-{region}-daily",
+    ("top200", "weekly"): "regional-{region}-weekly",
+    ("viral50", "daily"): "viral-{region}-daily",
+    ("viral50", "weekly"): "viral-{region}-weekly",
+}
 
 
 def parse_date(value, param_name):
@@ -95,8 +108,7 @@ def build_dates(start, end, is_weekly, is_viral, latest_only_if_unset=False):
     valid_date_list = sorted(valid_date_map.keys())
 
     if start is None and end is None and latest_only_if_unset:
-        start_dt = valid_date_list[-1]
-        end_dt = valid_date_list[-1]
+        return ["latest"]
     elif start is None:
         start_dt = valid_date_list[0]
     else:
@@ -152,27 +164,108 @@ def normalize_regions(regions):
     return regions
 
 
-def is_empty_df(df):
-    if "track name" not in df.columns:
-        return False
-    return df["track name"].eq("NA").all()
+def parse_spotify_id(uri):
+    if not uri or ":" not in uri:
+        return None
+    parts = uri.split(":")
+    return parts[-1] if len(parts) >= 3 else None
 
 
-def fetch_chart(fetch_fn, dates, regions):
+def require_token():
+    if CHARTS_TOKEN:
+        return CHARTS_TOKEN
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Spotify Charts now requires an access token. "
+            "Set SPOTIFY_CHARTS_TOKEN in Fly secrets."
+        ),
+    )
+
+
+def fetch_chart_entries(alias, date):
+    token = require_token()
+    url = f"{CHARTS_BASE_URL}/{alias}/{date}"
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=502,
+            detail="Spotify Charts token expired or invalid. Refresh SPOTIFY_CHARTS_TOKEN.",
+        )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Spotify Charts API error ({response.status_code}).",
+        )
+    payload = response.json()
+    return payload
+
+
+def normalize_alias(chart_key, region):
+    template = ALIAS_TEMPLATES[chart_key]
+    return template.format(region=region.lower())
+
+
+def extract_entries(payload, region_override=None):
+    display = payload.get("displayChart", {})
+    chart_date = display.get("date") or payload.get("date")
+    dimensions = display.get("chartMetadata", {}).get("dimensions", {})
+    region = (
+        region_override
+        or (dimensions.get("country") or "").lower()
+        or None
+    )
+
+    entries = []
+    for entry in payload.get("entries", []):
+        if entry.get("missingRequiredFields"):
+            continue
+        chart_data = entry.get("chartEntryData", {})
+        track_meta = entry.get("trackMetadata") or {}
+        artists = track_meta.get("artists") or []
+        artist_names = ", ".join(
+            [artist.get("name", "") for artist in artists if artist.get("name")]
+        )
+        rank_metric = chart_data.get("rankingMetric") or {}
+        streams = None
+        if rank_metric.get("type") == "STREAMS":
+            streams = rank_metric.get("value")
+
+        entries.append(
+            {
+                "Position": chart_data.get("currentRank"),
+                "Track Name": track_meta.get("trackName"),
+                "Artist": artist_names,
+                "Streams": streams,
+                "date": chart_date,
+                "region": region,
+                "spotify_id": parse_spotify_id(track_meta.get("trackUri")),
+            }
+        )
+    return entries
+
+
+def fetch_chart(chart_key, dates, regions):
     output = []
     misses = []
     for date in dates:
         for region in regions:
-            df = fetch_fn(date, region)
-            if is_empty_df(df):
+            alias = normalize_alias(chart_key, region)
+            payload = fetch_chart_entries(alias, date)
+            entries = extract_entries(payload, region_override=region)
+            if not entries:
                 misses.append(f"{date}/{region}")
                 continue
-            output.extend(df.to_dict(orient="records"))
+            output.extend(entries)
     if not output:
         detail = "No chart data returned for requested dates/regions."
         if misses:
             detail = (
-                "Spotifycharts returned no CSV data for: "
+                "Spotify Charts returned no entries for: "
                 + ", ".join(misses)
                 + "."
             )
@@ -193,7 +286,7 @@ def top200_daily(
 ):
     dates = build_dates(start, end, is_weekly=False, is_viral=False, latest_only_if_unset=True)
     regions = normalize_regions(region)
-    data = fetch_chart(charts.helperTop200Daily, dates, regions)
+    data = fetch_chart(("top200", "daily"), dates, regions)
     return {"chart": "top_200_daily", "data": data}
 
 
@@ -205,7 +298,7 @@ def top200_weekly(
 ):
     dates = build_dates(start, end, is_weekly=True, is_viral=False, latest_only_if_unset=True)
     regions = normalize_regions(region)
-    data = fetch_chart(charts.helperTop200Weekly, dates, regions)
+    data = fetch_chart(("top200", "weekly"), dates, regions)
     return {"chart": "top_200_weekly", "data": data}
 
 
@@ -217,7 +310,7 @@ def viral50_daily(
 ):
     dates = build_dates(start, end, is_weekly=False, is_viral=True, latest_only_if_unset=True)
     regions = normalize_regions(region)
-    data = fetch_chart(charts.helperViral50Daily, dates, regions)
+    data = fetch_chart(("viral50", "daily"), dates, regions)
     return {"chart": "viral_50_daily", "data": data}
 
 
@@ -229,5 +322,5 @@ def viral50_weekly(
 ):
     dates = build_dates(start, end, is_weekly=True, is_viral=True, latest_only_if_unset=True)
     regions = normalize_regions(region)
-    data = fetch_chart(charts.helperViral50Weekly, dates, regions)
+    data = fetch_chart(("viral50", "weekly"), dates, regions)
     return {"chart": "viral_50_weekly", "data": data}
